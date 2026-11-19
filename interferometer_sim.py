@@ -132,7 +132,9 @@ class Launch:
 
 
 def _default_launch() -> dict:
-    return {"A": Launch(tilt_x_mrad=0.6), "B": Launch(), "C": Launch(tilt_x_mrad=-0.6)}
+    # A and C tilts are deliberately unequal so the AB and BC fringes have different
+    # spatial frequencies (needed to read their phases separately, see PhaseLock)
+    return {"A": Launch(tilt_x_mrad=0.6), "B": Launch(), "C": Launch(tilt_x_mrad=-1.0)}
 
 
 @dataclass
@@ -143,7 +145,7 @@ class Setup:
     theta_B_deg: float = 12.0
     waist_mm: float = 1.0
     # where each beam lands with stage = 0 and tilt = 0 (mm on the camera)
-    base_x_mm: dict = field(default_factory=lambda: {"A": -1.75, "B": -0.07, "C": 1.36})
+    base_x_mm: dict = field(default_factory=lambda: {"A": -1.75, "B": -0.07, "C": 1.6})
     # distance from launching optic to camera (mm) - sets how far a tilt moves the beam
     lever_mm: dict = field(default_factory=lambda: {"A": 600.0, "B": 450.0, "C": 300.0})
     amp: dict = field(default_factory=lambda: {"A": 1.0, "B": 1.0, "C": 1.0})   # extra loss factors
@@ -257,9 +259,12 @@ class Setup:
 
 
 # ----------------------------------------------------------------- drawing
-def draw_setup(ax, s: "Setup") -> None:
+def draw_setup(ax, s: "Setup", lock: bool = False) -> None:
     """Draw the optical layout on `ax`, reflecting the current state of `s`
-    (slide tilts, blocks, stage and tilt values on PBS1 / PBS3 / M2)."""
+    (slide tilts, blocks, stage and tilt values on PBS1 / PBS3 / M2).
+    lock=True adds the phase-compensation hardware: 630 nm reference laser and
+    dichroic DM1, short-pass filter blocks, dichroic DM2 and reference camera,
+    motorized slides and the PC closing the loop."""
     from matplotlib.patches import Rectangle, FancyArrowPatch
 
     ax.clear()
@@ -317,8 +322,12 @@ def draw_setup(ax, s: "Setup") -> None:
     def block(cx, p):
         if not blk[p]:
             return
-        ax.add_patch(Rectangle((cx - 18, 446), 36, 10, fc="#222", ec="none", zorder=4))
-        ax.text(cx + 26, 455, "blocked", fontsize=8, color="#222", va="center")
+        if lock:   # short-pass filter: stops 810, passes 630
+            ax.add_patch(Rectangle((cx - 18, 446), 36, 10, fc="#7b4fd6", ec="#4b2a99", alpha=0.75, zorder=4))
+            ax.text(cx + 26, 455, "blocked (SP filter)", fontsize=8, color="#4b2a99", va="center")
+        else:
+            ax.add_patch(Rectangle((cx - 18, 446), 36, 10, fc="#222", ec="none", zorder=4))
+            ax.text(cx + 26, 455, "blocked", fontsize=8, color="#222", va="center")
 
     def adjust_label(cx, cy, p, dx=0, dy=0, ha="center"):
         L = s.launch[p]
@@ -364,6 +373,189 @@ def draw_setup(ax, s: "Setup") -> None:
     for x, p in [(330, "A"), (540, "B"), (780, "C")]:
         ax.text(x, 250, p, fontsize=18, fontweight="bold", color="#999", ha="center")
     ax.text(870, 215, "A, B, C side by side,\nslightly converging", fontsize=8, color="#555")
+
+    if not lock:
+        return
+    # ---- phase-compensation hardware
+    REF, CTL, NEW = "#ff8c00", "#0d8774", "#0d8774"
+
+    def ref(xs, ys, lw=1.3):
+        ax.plot(xs, ys, color=REF, lw=lw, zorder=2, solid_capstyle="butt")
+
+    # reference laser and DM1 (dichroic: passes 810, reflects 630 into the beam line)
+    ax.add_patch(Rectangle((183, 640), 24, 44, fc="#222", ec="none", zorder=3))
+    ax.add_patch(Rectangle((188, 634), 14, 6, fc=REF, ec="none", zorder=4))
+    ax.text(175, 668, "Ref laser\n630 nm", ha="right", va="center", fontsize=8, color=REF)
+    ref([195, 195], [634, 580])
+    ax.plot([181, 209], [594, 566], color=NEW, lw=4, solid_capstyle="round", zorder=4)
+    ax.text(195, 548, "DM1", ha="center", fontsize=8, color=NEW)
+    # reference beam follows every path (filter blocks pass 630)
+    ref([195, 820], [580, 580])
+    ref([370, 370], [580, 113]); ref([580, 580], [580, 120]); ref([820, 820], [580, 127])
+    ref([370, 1020, 1080], [113, 113, 118]); ref([580, 1080], [120, 120]); ref([820, 1020, 1080], [127, 127, 122])
+    # DM2 after the analyzer: 810 on to the PI-MAX, 630 down to the reference camera
+    ax.plot([1068, 1092], [108, 132], color=NEW, lw=4, solid_capstyle="round", zorder=4)
+    ax.text(1080, 92, "DM2", ha="center", fontsize=8, color=NEW)
+    ref([1080, 1080], [120, 222], lw=1.6)
+    ax.add_patch(Rectangle((1058, 222), 44, 34, fc="#222", ec="none", zorder=3))
+    ax.text(1080, 272, "ref camera\n(CMOS)", ha="center", va="top", fontsize=8, color=NEW)
+    # motorized slides + PC
+    for cx in (370, 580):
+        ax.add_patch(Rectangle((cx + 32, 330), 40, 20, fc="#d9f2ec", ec=NEW, lw=1.2, zorder=5))
+        ax.text(cx + 52, 340, "motor", ha="center", va="center", fontsize=7, color=NEW, zorder=6)
+    ax.add_patch(Rectangle((890, 385), 150, 46, fc="#d9f2ec", ec=NEW, lw=1.4, zorder=5))
+    ax.text(965, 400, "PC", ha="center", fontsize=9, fontweight="bold", color=NEW, zorder=6)
+    ax.text(965, 418, "fringe FFT → slide angles", ha="center", fontsize=7, color=NEW, zorder=6)
+    dash = dict(color=CTL, lw=1.2, ls=(0, (4, 3)), zorder=2)
+    ax.plot([1080, 1080, 1040], [292, 408, 408], **dash)
+    ax.plot([890, 422, 422], [408, 408, 350], **dash)
+    ax.plot([632, 632], [408, 350], **dash)
+    ax.text(30, 380, "red: 810 nm\norange: 630 nm reference\ndashed: feedback\n\nHWPs achromatic\n"
+            "beam blocks: short-pass\nfilters (stop 810, pass 630)", fontsize=8, color="#444", va="top")
+
+
+# ----------------------------------------------------------------- phase compensation
+def wrap(phi):
+    """Wrap to (-pi, pi]."""
+    return (np.asarray(phi) + np.pi) % (2 * np.pi) - np.pi
+
+
+def fringe_profile(s: "Setup", noise: float = 0.0, rng=None, rows: int = 128):
+    """Camera image of `s` (full width, the central `rows` rows) summed over rows
+    -> (x in mm, profile). `noise` is the Gaussian pixel noise as a fraction of the
+    brightest pixel."""
+    px = s.pixel_window()
+    c = s.px_to_mm(px)
+    X, Y = np.meshgrid(c, s.px_to_mm(s.pixel_window(rows)))
+    I = s.intensity(X, Y)
+    if noise:
+        rng = np.random.default_rng() if rng is None else rng
+        I = I + noise * I.max() * rng.standard_normal(I.shape)
+    return c, I.sum(axis=0)
+
+
+def pair_k(s: "Setup", pair: str) -> float:
+    """Spatial angular frequency (rad/mm along x) of the fringes between two paths."""
+    return s.beam(pair[0])["kx"] - s.beam(pair[1])["kx"]
+
+
+def find_fringe_k(x_mm, profile, k_expected: float, rel_window: float = 0.25) -> float:
+    """Locate the fringe peak in the profile's spectrum near k_expected (rad/mm)."""
+    n = 16 * len(profile)
+    F = np.abs(np.fft.rfft((profile - profile.mean()) * np.hanning(len(profile)), n))
+    k = 2 * np.pi * np.fft.rfftfreq(n, d=x_mm[1] - x_mm[0])
+    m = np.abs(k - abs(k_expected)) < rel_window * abs(k_expected)
+    return float(np.sign(k_expected) * k[m][np.argmax(F[m])])
+
+
+def fringe_phase(x_mm, profile, k: float) -> float:
+    """Phase of the fringe component exp(i k x) (k may be negative): for the pair
+    (p, q) with k = k_p - k_q this is phi_p - phi_q plus a fixed offset."""
+    return float(np.angle(np.sum(profile * np.exp(-1j * k * x_mm))))
+
+
+def solve_slide_angle(target_phase: float, theta_start: float, lam_nm: float, t_mm: float) -> float:
+    """Slide angle (deg) whose phase at lam_nm equals target_phase (Newton's method)."""
+    th = theta_start
+    for _ in range(30):
+        err = slide_phase(th, lam_nm, t_mm) - target_phase
+        th -= err / slide_slope(th, lam_nm, t_mm)
+        if abs(err) < 1e-9:
+            break
+    return th
+
+
+class PhaseLock:
+    """Holds the 810 nm phases phi_A - phi_C and phi_B - phi_C at their values at
+    lock time, using only the 630 nm reference camera.
+
+    Each update: read the reference fringe phases psi_AC, psi_BC (unwrapped), remove
+    what the slides themselves contributed at 630 nm, convert the rest to a
+    path-length drift dL, and rotate each slide so that its 810 nm phase cancels
+    2*pi*dL/810. The different dispersion of the slides at the two wavelengths is
+    therefore accounted for. New angles are rounded to the motor step."""
+
+    PAIRS = {"A": "AC", "B": "BC"}
+
+    def __init__(self, main: "Setup", ref: "Setup", motor_step_deg: float = 0.001):
+        self.main, self.ref, self.step = main, ref, motor_step_deg
+        x, prof = fringe_profile(ref)
+        for p, q in (("AB", "BC"),):
+            if abs(abs(pair_k(ref, p)) - abs(pair_k(ref, q))) < 0.15 * abs(pair_k(ref, q)):
+                raise ValueError("AB and BC fringes have (almost) the same spatial frequency: "
+                                 "make the A and C tilts unequal so their phases can be separated.")
+        self.k = {pair: find_fringe_k(x, prof, pair_k(ref, pair)) for pair in self.PAIRS.values()}
+        self.theta0 = {"A": main.theta_A_deg, "B": main.theta_B_deg}
+        self.psi0 = {pair: fringe_phase(x, prof, k) for pair, k in self.k.items()}
+        self.psi_last, self.psi_unw = dict(self.psi0), dict(self.psi0)
+
+    def update(self, x_mm, profile) -> dict:
+        """Feed one reference-camera profile; returns the new slide angles {"A": deg, "B": deg}."""
+        lr, lm, t = self.ref.lam_nm, self.main.lam_nm, self.main.slide_t_mm
+        theta_now = {"A": self.main.theta_A_deg, "B": self.main.theta_B_deg}
+        new = {}
+        for p, pair in self.PAIRS.items():
+            psi = fringe_phase(x_mm, profile, self.k[pair])
+            self.psi_unw[pair] += float(wrap(psi - self.psi_last[pair]))
+            self.psi_last[pair] = psi
+            slide_ref = slide_phase(theta_now[p], lr, t) - slide_phase(self.theta0[p], lr, t)
+            dL_nm = (self.psi_unw[pair] - self.psi0[pair] - slide_ref) * lr / (2 * np.pi)
+            target = slide_phase(self.theta0[p], lm, t) - 2 * np.pi * dL_nm / lm
+            th = solve_slide_angle(target, theta_now[p], lm, t)
+            new[p] = round(th / self.step) * self.step
+        return new
+
+
+def simulate_phase_lock(main: "Setup", ref_nm: float = 630.0, ref_pixel_um: float = 5.2,
+                        n_steps: int = 300, dt_s: float = 1.0, walk_nm: float = 3.0,
+                        rate_nm_s: dict | None = None, ref_noise: float = 0.02,
+                        motor_step_deg: float = 0.001, seed: int = 1) -> dict:
+    """Simulate thermal path-length drift with and without the lock.
+
+    Drift: each arm's path length does a random walk (walk_nm per sqrt(s)) plus a
+    steady rate (rate_nm_s, nm/s). The same path-length change shifts the phase by
+    2*pi*dL/lambda at each wavelength. Per time step the loop reads the reference
+    camera, moves the slides, and the 810 nm phase error is recorded at the moment
+    the PI-MAX would expose (right after the correction)."""
+    import copy
+    rng = np.random.default_rng(seed)
+    rate = {"A": 2.0, "B": -1.0, "C": 0.5} if rate_nm_s is None else rate_nm_s
+    locked, free = copy.deepcopy(main), copy.deepcopy(main)
+    for s in (locked, free):
+        for L in s.launch.values():
+            L.drift_rad, L.blocked = 0.0, False
+    ref = copy.deepcopy(locked)
+    ref.lam_nm, ref.pixel_um = ref_nm, ref_pixel_um
+
+    def apply_drift(s, dL):
+        for p in PATHS:
+            s.launch[p].drift_rad = 2 * np.pi * dL[p] / s.lam_nm
+
+    def rel(s):
+        ph = {p: s.beam(p)["phase"] for p in PATHS}
+        return np.array([ph["A"] - ph["C"], ph["B"] - ph["C"]])
+
+    lock = PhaseLock(locked, ref, motor_step_deg)
+    target = rel(locked)
+    dL = {p: 0.0 for p in PATHS}
+    out = {k: [] for k in ("t", "err_free", "err_lock", "theta_A", "theta_B", "dL_A", "dL_B", "dL_C")}
+    for i in range(1, n_steps + 1):
+        for p in PATHS:
+            dL[p] += rate[p] * dt_s + walk_nm * np.sqrt(dt_s) * rng.standard_normal()
+        for s in (locked, free, ref):
+            apply_drift(s, dL)
+        ref.theta_A_deg, ref.theta_B_deg = locked.theta_A_deg, locked.theta_B_deg
+        new = lock.update(*fringe_profile(ref, ref_noise, rng))
+        locked.theta_A_deg, locked.theta_B_deg = new["A"], new["B"]
+        out["t"].append(i * dt_s)
+        out["err_free"].append(wrap(rel(free) - target))
+        out["err_lock"].append(wrap(rel(locked) - target))
+        out["theta_A"].append(new["A"]); out["theta_B"].append(new["B"])
+        for p in PATHS:
+            out["dL_" + p].append(dL[p])
+    out = {k: np.array(v) for k, v in out.items()}
+    out.update(locked=locked, free=free, ref=ref, lock=lock)
+    return out
 
 
 def plt_circle(xy, r):
