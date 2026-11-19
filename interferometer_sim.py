@@ -159,6 +159,123 @@ class Setup:
         return out
 
 
+
+# ----------------------------------------------------------------- drawing
+def draw_setup(ax, s: "Setup") -> None:
+    """Draw the optical layout on `ax`, reflecting the current state of `s`
+    (slide tilts, blocks, stage and tilt values on PBS1 / PBS3 / M2)."""
+    from matplotlib.patches import Rectangle, FancyArrowPatch
+
+    ax.clear()
+    ax.set_xlim(10, 1210)
+    ax.set_ylim(680, 30)          # SVG-style coordinates: y grows downward
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    BEAM, OFF = "#d62728", 0.12
+    blk = {p: s.launch[p].blocked for p in PATHS}
+    anyopen = not all(blk.values())
+
+    def beam(xs, ys, on=True, lw=3.0):
+        ax.plot(xs, ys, color=BEAM, lw=lw, alpha=1.0 if on else OFF,
+                solid_capstyle="butt", zorder=1)
+
+    # ---- beams
+    beam([140, 820], [580, 580])
+    beam([370, 370], [580, 451]); beam([370, 370], [451, 113], not blk["A"])
+    beam([370, 1020, 1110], [113, 113, 118], not blk["A"], lw=2)
+    beam([580, 580], [580, 451]); beam([580, 580], [451, 120], not blk["B"])
+    beam([580, 1110], [120, 120], not blk["B"], lw=2)
+    beam([820, 820], [580, 451]); beam([820, 820], [451, 127], not blk["C"])
+    beam([820, 1020, 1110], [127, 127, 122], not blk["C"], lw=2)
+    beam([1040, 1040], [120, 66], anyopen, lw=1.5)
+
+    # ---- optics helpers
+    def cube(cx, cy, label, where="below"):
+        ax.add_patch(Rectangle((cx - 20, cy - 20), 40, 40, fc="#e9eef5", ec="#7d8899", lw=1.2, zorder=3))
+        ax.plot([cx - 20, cx + 20], [cy + 20, cy - 20], color="#7d8899", lw=1.2, zorder=4)
+        if where == "below":
+            ax.text(cx, cy + 38, label, ha="center", fontsize=9, zorder=5)
+        elif where == "above":
+            ax.text(cx, cy - 30, label, ha="center", fontsize=9, zorder=5)
+        else:  # upper left, clear of the vertical beam
+            ax.text(cx - 26, cy - 26, label, ha="right", fontsize=9, zorder=5)
+
+    def hwp(cx, cy, vertical_beam=False, label=None):
+        if vertical_beam:
+            ax.add_patch(Rectangle((cx - 19, cy - 4), 38, 8, fc="#1d6b73", ec="none", zorder=3))
+        else:
+            ax.add_patch(Rectangle((cx - 4, cy - 21), 8, 42, fc="#1d6b73", ec="none", zorder=3))
+        if label:
+            ax.text(cx, cy - 30, label, ha="center", fontsize=8, color="#555")
+
+    def mirror(cx, cy):
+        ax.plot([cx - 16, cx + 16], [cy + 16, cy - 16], color="#222", lw=5, solid_capstyle="round", zorder=4)
+
+    def slide(cx, cy, theta_deg, name):
+        th = np.deg2rad(theta_deg)
+        dx, dy = 26 * np.cos(th), 26 * np.sin(th)
+        ax.plot([cx - dx, cx + dx], [cy + dy, cy - dy], color="#e8c21c", lw=7, solid_capstyle="butt", zorder=4)
+        ax.plot([cx - dx, cx + dx], [cy + dy, cy - dy], color="#a88400", lw=0.8, zorder=5)
+        ax.text(cx - 40, cy + 4, f"{name}\n{theta_deg:.3f}°", ha="right", va="center", fontsize=8.5)
+
+    def block(cx, p):
+        x0 = cx - 18 if blk[p] else cx + 14
+        ax.add_patch(Rectangle((x0, 446), 36, 10, fc="#222" if blk[p] else "#bbb", ec="none", zorder=4))
+        ax.plot([cx - 18, cx + 50], [463, 463], color="#aaa", lw=1)
+        if blk[p]:
+            ax.text(cx + 54, 455, "blocked", fontsize=8, color="#222", va="center")
+
+    def adjust_label(cx, cy, p, dx=0, dy=0, ha="center"):
+        L = s.launch[p]
+        txt = (f"stage {L.stage_mm*1e3:+.1f} µm\n"
+               f"tilt x {L.tilt_x_mrad:+.2f}, y {L.tilt_y_mrad:+.2f} mrad")
+        ax.text(cx + dx, cy + dy, txt, ha=ha, va="top", fontsize=7.5, color="#0d8774",
+                bbox=dict(fc="white", ec="#0d8774", lw=0.8, boxstyle="round,pad=0.3"), zorder=6)
+
+    def stage_arrow(cx, cy):
+        ax.add_patch(FancyArrowPatch((cx - 26, cy), (cx + 26, cy), arrowstyle="<|-|>",
+                                     mutation_scale=9, color="#0d8774", lw=1.4, zorder=6))
+
+    # ---- source
+    ax.add_patch(Rectangle((30, 562), 110, 36, fc="#222", ec="none", zorder=3))
+    ax.add_patch(Rectangle((132, 570), 8, 20, fc=BEAM, ec="none", zorder=4))
+    ax.text(30, 552, f"Laser {s.lam_nm:.0f} nm", fontsize=9)
+    hwp(250, 580, label="HWP")
+
+    # ---- optics
+    cube(370, 580, "PBS1", "left"); stage_arrow(370, 612); adjust_label(370, 625, "A", dx=-30, ha="center")
+    cube(580, 580, "PBS3", "left"); stage_arrow(580, 612); adjust_label(580, 625, "B", dx=0, ha="center")
+    mirror(820, 580); ax.text(850, 590, "M2", fontsize=9)
+    stage_arrow(820, 612); adjust_label(820, 625, "C", dx=40, ha="center")
+    hwp(475, 580); hwp(700, 580)
+
+    slide(370, 340, s.theta_A_deg, "slide A")
+    slide(580, 340, s.theta_B_deg, "slide B")
+    block(370, "A"); block(580, "B"); block(820, "C")
+
+    mirror(370, 113); ax.text(345, 98, "M1", fontsize=9, ha="right")
+    hwp(470, 116)
+    cube(580, 120, "PBS2", "above")
+    hwp(700, 120)
+    cube(820, 120, "PBS4", "above")
+    hwp(900, 120)
+    cube(1040, 120, "analyzer PBS", "below")
+    ax.add_patch(Rectangle((1028, 50), 24, 16, fc="#222", ec="none")); ax.text(1060, 62, "dump", fontsize=8, color="#555")
+    ax.add_patch(Rectangle((1110, 92), 66, 56, fc="#222", ec="none", zorder=3))
+    ax.add_patch(plt_circle((1112, 120), 14))
+    ax.text(1143, 80, "PI-MAX 4", ha="center", fontsize=9)
+
+    # ---- path labels
+    for x, p in [(330, "A"), (540, "B"), (780, "C")]:
+        ax.text(x, 250, p, fontsize=18, fontweight="bold", color="#999", ha="center")
+    ax.text(870, 215, "A, B, C side by side,\nslightly converging", fontsize=8, color="#555")
+
+
+def plt_circle(xy, r):
+    from matplotlib.patches import Circle
+    return Circle(xy, r, fc="#8c96a5", ec="none", zorder=4)
+
 if __name__ == "__main__":
     s = Setup()
     x, y, I = s.camera()
