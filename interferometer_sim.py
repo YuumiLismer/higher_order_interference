@@ -90,6 +90,9 @@ class Setup:
     amp: dict = field(default_factory=lambda: {"A": 1.0, "B": 1.0, "C": 1.0})
     stage_changes_phase: bool = True
     launch: dict = field(default_factory=_default_launch)
+    # camera: PI-MAX 4 1024 x 1024 (pixel pitch assumed 12.8 um - check your model)
+    npix: int = 1024
+    pixel_um: float = 12.8
 
     # -------------------------------------------------------------- per-beam
     def k_per_mm(self) -> float:
@@ -141,11 +144,27 @@ class Setup:
         env = sum(self._envelope(X, Y, self.beam(p)) for p in PATHS)
         return float(np.max(env**2))
 
-    def camera(self, fov_mm: float = 3.0, n: int = 241):
-        """Return x, y (mm) and intensity on an n x n grid of half-width fov_mm."""
-        x = np.linspace(-fov_mm, fov_mm, n)
-        X, Y = np.meshgrid(x, x)
-        return x, x, self.intensity(X, Y)
+    # -------------------------------------------------------------- camera
+    def mm_to_px(self, v_mm):
+        """Camera position in mm (0 = sensor centre) -> pixel index."""
+        return np.asarray(v_mm) / (self.pixel_um * 1e-3) + (self.npix - 1) / 2
+
+    def px_to_mm(self, v_px):
+        return (np.asarray(v_px) - (self.npix - 1) / 2) * self.pixel_um * 1e-3
+
+    def pixel_window(self, n_view: int | None = None) -> np.ndarray:
+        """Pixel indices of a centred n_view-wide window (whole sensor if None)."""
+        n = self.npix if n_view is None else min(int(n_view), self.npix)
+        i0 = (self.npix - n) // 2
+        return np.arange(i0, i0 + n)
+
+    def camera(self, n_view: int | None = None):
+        """Intensity on every pixel of a centred n_view x n_view window.
+        Returns (pixel indices, intensity[row, col])."""
+        px = self.pixel_window(n_view)
+        c = self.px_to_mm(px)
+        X, Y = np.meshgrid(c, c)
+        return px, self.intensity(X, Y)
 
     def fringe_periods(self) -> dict:
         """Fringe period (mm) for each open pair, from the angle between beams."""
@@ -157,6 +176,10 @@ class Setup:
                 dk = np.hypot(bp["kx"] - bq["kx"], bp["ky"] - bq["ky"])
                 out[p + q] = np.inf if dk == 0 else 2 * np.pi / dk
         return out
+
+    def fringe_periods_px(self) -> dict:
+        """Fringe period in camera pixels for each open pair."""
+        return {k: v / (self.pixel_um * 1e-3) for k, v in self.fringe_periods().items()}
 
 
 
@@ -274,8 +297,8 @@ def plt_circle(xy, r):
 
 if __name__ == "__main__":
     s = Setup()
-    x, y, I = s.camera()
+    px, I = s.camera()
+    print("frame shape:", I.shape)
     print("phases mod 2pi:", {k: round(v, 3) for k, v in s.phases().items()})
-    print("fringe periods (mm):", {k: round(v, 3) for k, v in s.fringe_periods().items()})
+    print("fringe periods (px):", {k: round(v, 1) for k, v in s.fringe_periods_px().items()})
     print("dphi/dtheta A (rad/deg):", round(slide_slope(s.theta_A_deg, s.lam_nm, s.slide_t_mm), 1))
-    print("I range:", I.min(), I.max(), "max possible:", s.max_intensity(*np.meshgrid(x, y)))
