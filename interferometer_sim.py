@@ -218,11 +218,10 @@ def draw_setup(ax, s: "Setup") -> None:
         ax.text(cx - 40, cy + 4, f"{name}\n{theta_deg:.3f}°", ha="right", va="center", fontsize=8.5)
 
     def block(cx, p):
-        x0 = cx - 18 if blk[p] else cx + 14
-        ax.add_patch(Rectangle((x0, 446), 36, 10, fc="#222" if blk[p] else "#bbb", ec="none", zorder=4))
-        ax.plot([cx - 18, cx + 50], [463, 463], color="#aaa", lw=1)
-        if blk[p]:
-            ax.text(cx + 54, 455, "blocked", fontsize=8, color="#222", va="center")
+        if not blk[p]:
+            return
+        ax.add_patch(Rectangle((cx - 18, 446), 36, 10, fc="#222", ec="none", zorder=4))
+        ax.text(cx + 26, 455, "blocked", fontsize=8, color="#222", va="center")
 
     def adjust_label(cx, cy, p, dx=0, dy=0, ha="center"):
         L = s.launch[p]
