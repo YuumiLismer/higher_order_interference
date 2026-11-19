@@ -492,77 +492,123 @@ class XPSAxis:
         self.pos += np.clip(d, -self.vel * dt, self.vel * dt)
 
 
-def simulate_intensity_lock(main: "Setup", n_pd: int = 2, ref_nm: float = 630.0, pinhole_um: float = 50.0,
-                            duration_s: float = 300.0, dt_s: float = 0.01, loop_hz: float = 10.0,
-                            latency_s: float = 0.05, vel_deg_s: float = 2.0, step_deg: float = 0.001,
-                            gain: float = 0.5, walk_nm: float = 3.0, rate_nm_s: dict | None = None,
-                            pd_noise: float = 0.002, record_every_s: float = 0.1, seed: int = 1) -> dict:
-    """Simulate thermal path-length drift with an intensity lock on the 630 nm reference.
+class IntensityLockSim:
+    """Step-by-step simulation of the intensity lock (see simulate_intensity_lock).
 
-    The reference passes all three paths (short-pass filter blocks, achromatic HWPs) and
-    lands on n_pd pinholes + photodiodes. At lock time the photodiode readings are stored
-    as setpoints and the 2 x 2 (or 1 x 2) Jacobian dI/dtheta is measured. At loop_hz the
+    The 630 nm reference passes all three paths (short-pass filter blocks, achromatic
+    HWPs) and lands on n_pd pinholes + photodiodes. At lock time the photodiode readings
+    are stored as setpoints and the Jacobian dI/dtheta is measured. Every 1/loop_hz the
     PC reads the photodiodes (relative noise pd_noise) and sends integral corrections
     gain * pinv(J) @ (setpoint - I) to the two XPS axes, which apply them after latency_s
     at up to vel_deg_s. Drift: each arm's path length does a random walk (walk_nm per
-    sqrt(s)) plus a steady rate (nm/s); a path-length change dL shifts the phase by
-    2*pi*dL/lambda at both wavelengths. Holding the 630 nm phases fixed leaves a small
-    810 nm residual because the slide glass disperses slightly differently from air."""
-    import copy
-    rng = np.random.default_rng(seed)
-    rate = {"A": 2.0, "B": -1.0, "C": 0.5} if rate_nm_s is None else rate_nm_s
-    locked, free = copy.deepcopy(main), copy.deepcopy(main)
-    for s_ in (locked, free):
-        for L in s_.launch.values():
-            L.drift_rad, L.blocked = 0.0, False
-    ref = copy.deepcopy(locked)
-    ref.lam_nm = ref_nm
+    sqrt(s)) plus a steady rate (nm/s), plus optional sudden kicks [(t_s, arm, nm), ...].
+    A path-length change dL shifts the phase by 2*pi*dL/lambda at both wavelengths."""
 
-    x_ph = choose_pinholes(ref, n=n_pd, d_um=pinhole_um)
-    J = slide_jacobian(ref, x_ph, pinhole_um)
-    Jinv = np.linalg.pinv(J)
-    I_set = pinhole_intensity(ref, x_ph, pinhole_um)
-    axes = [XPSAxis(locked.theta_A_deg, latency_s, vel_deg_s, step_deg),
-            XPSAxis(locked.theta_B_deg, latency_s, vel_deg_s, step_deg)]
+    def __init__(self, main: "Setup", n_pd: int = 2, ref_nm: float = 630.0, pinhole_um: float = 50.0,
+                 dt_s: float = 0.01, loop_hz: float = 10.0, latency_s: float = 0.05,
+                 vel_deg_s: float = 2.0, step_deg: float = 0.001, gain: float = 0.5,
+                 walk_nm: float = 3.0, rate_nm_s: dict | None = None, pd_noise: float = 0.002,
+                 kicks_nm=(), seed: int = 1):
+        import copy
+        self.rng = np.random.default_rng(seed)
+        self.rate = {"A": 2.0, "B": -1.0, "C": 0.5} if rate_nm_s is None else rate_nm_s
+        self.walk, self.pd_noise, self.gain, self.pinhole_um = walk_nm, pd_noise, gain, pinhole_um
+        self.dt, self.kicks = dt_s, sorted(kicks_nm)
+        self.locked, self.free = copy.deepcopy(main), copy.deepcopy(main)
+        for s_ in (self.locked, self.free):
+            for L in s_.launch.values():
+                L.drift_rad, L.blocked = 0.0, False
+        self.ref = copy.deepcopy(self.locked)
+        self.ref.lam_nm = ref_nm
+        self.x_ph = choose_pinholes(self.ref, n=n_pd, d_um=pinhole_um)
+        self.J = slide_jacobian(self.ref, self.x_ph, pinhole_um)
+        self.Jinv = np.linalg.pinv(self.J)
+        self.I_set = pinhole_intensity(self.ref, self.x_ph, pinhole_um)
+        self.I_meas = self.I_set.copy()
+        self.axes = [XPSAxis(self.locked.theta_A_deg, latency_s, vel_deg_s, step_deg),
+                     XPSAxis(self.locked.theta_B_deg, latency_s, vel_deg_s, step_deg)]
+        self.theta0 = (self.locked.theta_A_deg, self.locked.theta_B_deg)
+        self.target = self.rel(self.locked)
+        self.dL = {p: 0.0 for p in PATHS}
+        self.every_loop = max(1, int(round(1 / (loop_hz * dt_s))))
+        self.i, self.t, self.n_updates, self.events = 0, 0.0, 0, []
 
+    @staticmethod
     def rel(s_):
         ph = {p: s_.beam(p)["phase"] for p in PATHS}
         return np.array([ph["A"] - ph["C"], ph["B"] - ph["C"]])
 
-    target = rel(locked)
-    dL = {p: 0.0 for p in PATHS}
+    def step(self):
+        """Advance the simulation by one time step dt_s."""
+        self.i += 1
+        self.t = self.i * self.dt
+        for p in PATHS:
+            self.dL[p] += self.rate[p] * self.dt + self.walk * np.sqrt(self.dt) * self.rng.standard_normal()
+        while self.kicks and self.kicks[0][0] <= self.t:
+            tk, arm, nm = self.kicks.pop(0)
+            self.dL[arm] += nm
+            self.events.append((self.t, f"arm {arm} path jumps {nm:+.0f} nm"))
+        for ax_ in self.axes:
+            ax_.advance(self.t, self.dt)
+        for s_ in (self.locked, self.free, self.ref):
+            for p in PATHS:
+                s_.launch[p].drift_rad = 2 * np.pi * self.dL[p] / s_.lam_nm
+        self.locked.theta_A_deg = self.ref.theta_A_deg = self.axes[0].pos
+        self.locked.theta_B_deg = self.ref.theta_B_deg = self.axes[1].pos
+        if self.i % self.every_loop == 0:
+            self.I_meas = pinhole_intensity(self.ref, self.x_ph, self.pinhole_um) * (
+                1 + self.pd_noise * self.rng.standard_normal(len(self.x_ph)))
+            d_theta = self.gain * self.Jinv @ (self.I_set - self.I_meas)
+            for ax_, d in zip(self.axes, d_theta):
+                ax_.command(self.t, ax_.cmd + d)
+            self.n_updates += 1
+
+    def snapshot(self) -> dict:
+        """Current errors, photodiode signals and stage states."""
+        status = []
+        for ax_ in self.axes:
+            if ax_.queue:
+                status.append("command sent, waiting (XPS latency)")
+            elif abs(ax_.pos - ax_.target) > 1e-12:
+                status.append("moving")
+            else:
+                status.append("settled")
+        return dict(t=self.t, err_free=wrap(self.rel(self.free) - self.target),
+                    err_lock=wrap(self.rel(self.locked) - self.target),
+                    pd=pinhole_intensity(self.ref, self.x_ph, self.pinhole_um) / self.I_set,
+                    theta=[a.pos for a in self.axes], cmd=[a.cmd for a in self.axes],
+                    status=status, dL=dict(self.dL))
+
+
+def simulate_intensity_lock(main: "Setup", n_pd: int = 2, ref_nm: float = 630.0, pinhole_um: float = 50.0,
+                            duration_s: float = 300.0, dt_s: float = 0.01, loop_hz: float = 10.0,
+                            latency_s: float = 0.05, vel_deg_s: float = 2.0, step_deg: float = 0.001,
+                            gain: float = 0.5, walk_nm: float = 3.0, rate_nm_s: dict | None = None,
+                            pd_noise: float = 0.002, record_every_s: float = 0.1, seed: int = 1,
+                            kicks_nm=()) -> dict:
+    """Run IntensityLockSim for duration_s and record every record_every_s. Holding the
+    630 nm phases fixed leaves a small 810 nm residual because the slide glass disperses
+    slightly differently from air."""
+    sim = IntensityLockSim(main, n_pd=n_pd, ref_nm=ref_nm, pinhole_um=pinhole_um, dt_s=dt_s,
+                           loop_hz=loop_hz, latency_s=latency_s, vel_deg_s=vel_deg_s, step_deg=step_deg,
+                           gain=gain, walk_nm=walk_nm, rate_nm_s=rate_nm_s, pd_noise=pd_noise,
+                           kicks_nm=kicks_nm, seed=seed)
     n = int(round(duration_s / dt_s))
-    every_loop = max(1, int(round(1 / (loop_hz * dt_s))))
     every_rec = max(1, int(round(record_every_s / dt_s)))
     keys = ("t", "err_free", "err_lock", "pd", "theta_A", "theta_B", "cmd_A", "cmd_B", "dL_A", "dL_B", "dL_C")
     out = {k: [] for k in keys}
     for i in range(1, n + 1):
-        t = i * dt_s
-        for p in PATHS:
-            dL[p] += rate[p] * dt_s + walk_nm * np.sqrt(dt_s) * rng.standard_normal()
-        for ax_ in axes:
-            ax_.advance(t, dt_s)
-        for s_ in (locked, free, ref):
-            for p in PATHS:
-                s_.launch[p].drift_rad = 2 * np.pi * dL[p] / s_.lam_nm
-        locked.theta_A_deg = ref.theta_A_deg = axes[0].pos
-        locked.theta_B_deg = ref.theta_B_deg = axes[1].pos
-        if i % every_loop == 0:
-            I = pinhole_intensity(ref, x_ph, pinhole_um) * (1 + pd_noise * rng.standard_normal(len(x_ph)))
-            d_theta = gain * Jinv @ (I_set - I)
-            for ax_, d in zip(axes, d_theta):
-                ax_.command(t, ax_.cmd + d)
+        sim.step()
         if i % every_rec == 0:
-            out["t"].append(t)
-            out["err_free"].append(wrap(rel(free) - target))
-            out["err_lock"].append(wrap(rel(locked) - target))
-            out["pd"].append(pinhole_intensity(ref, x_ph, pinhole_um) / I_set)
-            out["theta_A"].append(axes[0].pos); out["theta_B"].append(axes[1].pos)
-            out["cmd_A"].append(axes[0].cmd); out["cmd_B"].append(axes[1].cmd)
+            snap = sim.snapshot()
+            for k in ("t", "err_free", "err_lock", "pd"):
+                out[k].append(snap[k])
+            out["theta_A"].append(snap["theta"][0]); out["theta_B"].append(snap["theta"][1])
+            out["cmd_A"].append(snap["cmd"][0]); out["cmd_B"].append(snap["cmd"][1])
             for p in PATHS:
-                out["dL_" + p].append(dL[p])
+                out["dL_" + p].append(snap["dL"][p])
     out = {k: np.array(v) for k, v in out.items()}
-    out.update(locked=locked, free=free, ref=ref, x_pinholes=x_ph, J=J, I_set=I_set)
+    out.update(locked=sim.locked, free=sim.free, ref=sim.ref, x_pinholes=sim.x_ph, J=sim.J, I_set=sim.I_set)
     return out
 
 
