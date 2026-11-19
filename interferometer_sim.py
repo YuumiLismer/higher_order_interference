@@ -174,7 +174,6 @@ def draw_setup(ax, s: "Setup") -> None:
 
     BEAM, OFF = "#d62728", 0.12
     blk = {p: s.launch[p].blocked for p in PATHS}
-    anyopen = not all(blk.values())
 
     def beam(xs, ys, on=True, lw=3.0):
         ax.plot(xs, ys, color=BEAM, lw=lw, alpha=1.0 if on else OFF,
@@ -188,7 +187,6 @@ def draw_setup(ax, s: "Setup") -> None:
     beam([580, 1110], [120, 120], not blk["B"], lw=2)
     beam([820, 820], [580, 451]); beam([820, 820], [451, 127], not blk["C"])
     beam([820, 1020, 1110], [127, 127, 122], not blk["C"], lw=2)
-    beam([1040, 1040], [120, 66], anyopen, lw=1.5)
 
     # ---- optics helpers
     def cube(cx, cy, label, where="below"):
@@ -261,7 +259,6 @@ def draw_setup(ax, s: "Setup") -> None:
     cube(820, 120, "PBS4", "above")
     hwp(900, 120)
     cube(1040, 120, "analyzer PBS", "below")
-    ax.add_patch(Rectangle((1028, 50), 24, 16, fc="#222", ec="none")); ax.text(1060, 62, "dump", fontsize=8, color="#555")
     ax.add_patch(Rectangle((1110, 92), 66, 56, fc="#222", ec="none", zorder=3))
     ax.add_patch(plt_circle((1112, 120), 14))
     ax.text(1143, 80, "PI-MAX 4", ha="center", fontsize=9)
