@@ -18,9 +18,19 @@ For each of those optics you can set
     * a horizontal / vertical tilt delta: the beam angle changes by 2*delta and,
       over the lever arm L to the camera, the beam moves by 2*delta*L.
 
-Units: wavelengths in nm, lengths in mm, angles in mrad (optics) or deg (slides).
-Fields are scalar; the analyzer is assumed to project all three paths onto the
-same polarization with the amplitudes given in `Setup.amp`.
+Polarization is tracked with Jones calculus. Every half-wave plate has an angle
+(fast axis from H = table plane) and every PBS transmits H and reflects V, with
+an optional leakage `pbs_leak` (fraction of the wrong polarization's power that
+goes the wrong way). The amplitude each path delivers to the camera therefore
+follows from the HWP angles; `equal_intensity_angles()` gives the settings that
+make all three equal (1/9 of the laser power each, the maximum possible).
+
+    HWP0  input, before PBS1            HWP3  arm C, between PBS3 and M2
+    HWP1  between PBS1 and PBS3          HWP4  between PBS2 and PBS4
+    HWP2  arm A, between M1 and PBS2     HWP5  between PBS4 and the analyzer PBS
+
+Units: wavelengths in nm, lengths in mm, angles in mrad (optics) or deg (slides,
+waveplates).
 """
 from __future__ import annotations
 
@@ -61,6 +71,55 @@ def slide_slope(theta_deg: float, lam_nm: float, t_mm: float) -> float:
             - slide_phase(theta_deg - h, lam_nm, t_mm)) / (2 * h)
 
 
+# ----------------------------------------------------------------- polarization
+HWP_NAMES = ("HWP0", "HWP1", "HWP2", "HWP3", "HWP4", "HWP5")
+HWP_WHERE = {"HWP0": "input", "HWP1": "PBS1 → PBS3", "HWP2": "arm A (top)",
+             "HWP3": "arm C (bottom)", "HWP4": "before PBS4", "HWP5": "before analyzer"}
+
+
+def hwp_matrix(theta_deg: float) -> np.ndarray:
+    """Jones matrix of a half-wave plate with fast axis at theta from H."""
+    t = np.deg2rad(2 * theta_deg)
+    return np.array([[np.cos(t), np.sin(t)], [np.sin(t), -np.cos(t)]])
+
+
+def _pbs_t(leak: float) -> np.ndarray:   # transmitted port: H passes, V leaks
+    return np.diag([1.0, np.sqrt(leak)])
+
+
+def _pbs_r(leak: float) -> np.ndarray:   # reflected port: V passes, H leaks
+    return np.diag([np.sqrt(leak), 1.0])
+
+
+def jones_paths(hwp_deg: dict, input_pol_deg: float = 0.0, leak: float = 0.0) -> dict:
+    """Jones vector (E_H, E_V) that each path delivers to the camera, for unit
+    laser amplitude linearly polarized at input_pol_deg from H."""
+    W = lambda n: hwp_matrix(hwp_deg[n])
+    T, R = _pbs_t(leak), _pbs_r(leak)
+    r = np.deg2rad(input_pol_deg)
+    E = W("HWP0") @ np.array([np.cos(r), np.sin(r)])
+    A, bottom = R @ E, T @ E                      # PBS1: reflected -> A, transmitted -> B/C
+    A = T @ (W("HWP2") @ A)                       # arm A enters PBS2 from the left: transmitted
+    bottom = W("HWP1") @ bottom
+    B, C = R @ bottom, T @ bottom                 # PBS3: reflected -> B, transmitted -> C
+    B = R @ B                                     # arm B enters PBS2 from below: reflected
+    A, B = (T @ (W("HWP4") @ v) for v in (A, B))  # A+B enter PBS4 from the left: transmitted
+    C = R @ (W("HWP3") @ C)                       # arm C enters PBS4 from below: reflected
+    return {p: T @ (W("HWP5") @ v) for p, v in (("A", A), ("B", B), ("C", C))}  # analyzer
+
+
+def equal_intensity_angles(input_pol_deg: float = 0.0) -> dict:
+    """HWP angles (deg) giving equal power from A, B, C at the camera with the
+    largest possible throughput (1/9 of the laser each), for ideal PBSs.
+
+    HWP0 puts 1/3 into A, HWP1 splits the rest equally into B and C, HWP2 / HWP3
+    rotate A and C by 90 deg so PBS2 / PBS4 pass them, HWP4 mixes A and B equally,
+    and HWP5 weights (A+B) : C as 2 : 1 at the analyzer."""
+    alpha = np.degrees(np.arcsin(1 / np.sqrt(3)))          # 35.26 deg
+    return {"HWP0": float((alpha + input_pol_deg) / 2), "HWP1": 22.5, "HWP2": 45.0,
+            "HWP3": 45.0, "HWP4": 22.5, "HWP5": float(np.degrees(np.arccos(np.sqrt(2 / 3))) / 2)}
+
+
 # ----------------------------------------------------------------- beams
 @dataclass
 class Launch:
@@ -87,7 +146,10 @@ class Setup:
     base_x_mm: dict = field(default_factory=lambda: {"A": -1.75, "B": -0.07, "C": 1.36})
     # distance from launching optic to camera (mm) - sets how far a tilt moves the beam
     lever_mm: dict = field(default_factory=lambda: {"A": 600.0, "B": 450.0, "C": 300.0})
-    amp: dict = field(default_factory=lambda: {"A": 1.0, "B": 1.0, "C": 1.0})
+    amp: dict = field(default_factory=lambda: {"A": 1.0, "B": 1.0, "C": 1.0})   # extra loss factors
+    hwp_deg: dict = field(default_factory=equal_intensity_angles)
+    input_pol_deg: float = 0.0   # laser polarization angle from H
+    pbs_leak: float = 0.0        # e.g. 1e-3 for a 1000:1 PBS
     stage_changes_phase: bool = True
     launch: dict = field(default_factory=_default_launch)
     # camera: PI-MAX 4 1024 x 1024 (pixel pitch assumed 12.8 um - check your model)
@@ -115,33 +177,44 @@ class Setup:
         if self.stage_changes_phase:
             phase += 2 * np.pi * (L.stage_mm * 1e6) / self.lam_nm
         k = self.k_per_mm()
+        jones = self.amp[p] * jones_paths(self.hwp_deg, self.input_pol_deg, self.pbs_leak)[p]
         return dict(x0=x0, y0=y0, kx=k * ang_x, ky=k * ang_y,
                     angle_x_mrad=ang_x * 1e3, angle_y_mrad=ang_y * 1e3,
-                    phase=phase, amp=self.amp[p], blocked=L.blocked)
+                    phase=phase, jones=jones, amp=float(np.linalg.norm(jones)),
+                    blocked=L.blocked)
+
+    def camera_powers(self) -> dict:
+        """Fraction of the laser power each path delivers to the camera."""
+        J = jones_paths(self.hwp_deg, self.input_pol_deg, self.pbs_leak)
+        return {p: float(self.amp[p]**2 * np.sum(np.abs(J[p])**2)) for p in PATHS}
 
     def phases(self) -> dict:
         """Phase of each path, mod 2*pi."""
         return {p: float(np.mod(self.beam(p)["phase"], 2 * np.pi)) for p in PATHS}
 
     # -------------------------------------------------------------- fields
-    def _envelope(self, X, Y, b):
-        return b["amp"] * np.exp(-((X - b["x0"])**2 + (Y - b["y0"])**2) / self.waist_mm**2)
+    def _gauss(self, X, Y, b):
+        return np.exp(-((X - b["x0"])**2 + (Y - b["y0"])**2) / self.waist_mm**2)
 
     def field(self, X, Y):
-        E = np.zeros(np.broadcast(X, Y).shape, dtype=complex)
+        """Jones field at the camera, shape (2, *X.shape): (E_H, E_V)."""
+        E = np.zeros((2,) + np.broadcast(X, Y).shape, dtype=complex)
         for p in PATHS:
             b = self.beam(p)
             if b["blocked"]:
                 continue
-            E += self._envelope(X, Y, b) * np.exp(1j * (b["kx"] * X + b["ky"] * Y + b["phase"]))
+            scalar = self._gauss(X, Y, b) * np.exp(1j * (b["kx"] * X + b["ky"] * Y + b["phase"]))
+            E += b["jones"].reshape(2, *([1] * scalar.ndim)) * scalar
         return E
 
     def intensity(self, X, Y):
-        return np.abs(self.field(X, Y))**2
+        return np.sum(np.abs(self.field(X, Y))**2, axis=0)
 
     def max_intensity(self, X, Y) -> float:
-        """Brightest value possible on this grid (all paths open and in phase)."""
-        env = sum(self._envelope(X, Y, self.beam(p)) for p in PATHS)
+        """Brightest value on this grid for the ideal equal split (each path
+        delivering 1/9 of the laser power) with all paths in phase. Used to
+        normalise plots, so a badly set waveplate shows up as a dimmer image."""
+        env = sum(self._gauss(X, Y, self.beam(p)) / 3 for p in PATHS)
         return float(np.max(env**2))
 
     # -------------------------------------------------------------- camera
@@ -228,7 +301,8 @@ def draw_setup(ax, s: "Setup") -> None:
         else:
             ax.add_patch(Rectangle((cx - 4, cy - 21), 8, 42, fc="#1d6b73", ec="none", zorder=3))
         if label:
-            ax.text(cx, cy - 30, label, ha="center", fontsize=8, color="#555")
+            ax.text(cx, cy - 25, label, ha="center", va="bottom", fontsize=7.5, color="#1d6b73",
+                    linespacing=1.1, zorder=5)
 
     def mirror(cx, cy):
         ax.plot([cx - 16, cx + 16], [cy + 16, cy - 16], color="#222", lw=5, solid_capstyle="round", zorder=4)
@@ -261,25 +335,26 @@ def draw_setup(ax, s: "Setup") -> None:
     ax.add_patch(Rectangle((30, 562), 110, 36, fc="#222", ec="none", zorder=3))
     ax.add_patch(Rectangle((132, 570), 8, 20, fc=BEAM, ec="none", zorder=4))
     ax.text(30, 552, f"Laser {s.lam_nm:.0f} nm", fontsize=9)
-    hwp(250, 580, label="HWP")
+    hl = {n: f"{n}\n{s.hwp_deg[n]:.2f}°" for n in HWP_NAMES}
+    hwp(250, 580, label=hl["HWP0"])
 
     # ---- optics
     cube(370, 580, "PBS1", "left"); stage_arrow(370, 612); adjust_label(370, 625, "A", dx=-30, ha="center")
     cube(580, 580, "PBS3", "left"); stage_arrow(580, 612); adjust_label(580, 625, "B", dx=0, ha="center")
     mirror(820, 580); ax.text(850, 590, "M2", fontsize=9)
     stage_arrow(820, 612); adjust_label(820, 625, "C", dx=40, ha="center")
-    hwp(475, 580); hwp(700, 580)
+    hwp(475, 580, label=hl["HWP1"]); hwp(700, 580, label=hl["HWP3"])
 
     slide(370, 340, s.theta_A_deg, "slide A")
     slide(580, 340, s.theta_B_deg, "slide B")
     block(370, "A"); block(580, "B"); block(820, "C")
 
     mirror(370, 113); ax.text(345, 98, "M1", fontsize=9, ha="right")
-    hwp(470, 116)
+    hwp(470, 116, label=hl["HWP2"])
     cube(580, 120, "PBS2", "above")
-    hwp(700, 120)
+    hwp(700, 120, label=hl["HWP4"])
     cube(820, 120, "PBS4", "above")
-    hwp(900, 120)
+    hwp(900, 120, label=hl["HWP5"])
     cube(1040, 120, "analyzer PBS", "below")
     ax.add_patch(Rectangle((1110, 92), 66, 56, fc="#222", ec="none", zorder=3))
     ax.add_patch(plt_circle((1112, 120), 14))
@@ -302,3 +377,5 @@ if __name__ == "__main__":
     print("phases mod 2pi:", {k: round(v, 3) for k, v in s.phases().items()})
     print("fringe periods (px):", {k: round(v, 1) for k, v in s.fringe_periods_px().items()})
     print("dphi/dtheta A (rad/deg):", round(slide_slope(s.theta_A_deg, s.lam_nm, s.slide_t_mm), 1))
+    print("equal-intensity HWP angles:", {k: round(v, 3) for k, v in equal_intensity_angles().items()})
+    print("power to camera per path:", {k: round(v, 5) for k, v in s.camera_powers().items()})
