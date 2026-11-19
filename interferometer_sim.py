@@ -132,8 +132,7 @@ class Launch:
 
 
 def _default_launch() -> dict:
-    # A and C tilts are deliberately unequal so the AB and BC fringes have different
-    # spatial frequencies (needed to read their phases separately, see PhaseLock)
+    # A and C tilts are deliberately unequal so the AB and BC fringes have different periods
     return {"A": Launch(tilt_x_mrad=0.6), "B": Launch(), "C": Launch(tilt_x_mrad=-1.0)}
 
 
@@ -263,8 +262,8 @@ def draw_setup(ax, s: "Setup", lock: bool = False) -> None:
     """Draw the optical layout on `ax`, reflecting the current state of `s`
     (slide tilts, blocks, stage and tilt values on PBS1 / PBS3 / M2).
     lock=True adds the phase-compensation hardware: 630 nm reference laser and
-    dichroic DM1, short-pass filter blocks, dichroic DM2 and reference camera,
-    motorized slides and the PC closing the loop."""
+    dichroic DM1, short-pass filter blocks, dichroic DM2, two pinholes + photodiodes,
+    and the PC + Newport XPS turning the slides."""
     from matplotlib.patches import Rectangle, FancyArrowPatch
 
     ax.clear()
@@ -393,24 +392,32 @@ def draw_setup(ax, s: "Setup", lock: bool = False) -> None:
     ref([195, 820], [580, 580])
     ref([370, 370], [580, 113]); ref([580, 580], [580, 120]); ref([820, 820], [580, 127])
     ref([370, 1020, 1080], [113, 113, 118]); ref([580, 1080], [120, 120]); ref([820, 1020, 1080], [127, 127, 122])
-    # DM2 after the analyzer: 810 on to the PI-MAX, 630 down to the reference camera
+    # DM2 after the analyzer: 810 on to the PI-MAX, 630 down to two pinholes + photodiodes
     ax.plot([1068, 1092], [108, 132], color=NEW, lw=4, solid_capstyle="round", zorder=4)
     ax.text(1080, 92, "DM2", ha="center", fontsize=8, color=NEW)
-    ref([1080, 1080], [120, 222], lw=1.6)
-    ax.add_patch(Rectangle((1058, 222), 44, 34, fc="#222", ec="none", zorder=3))
-    ax.text(1080, 272, "ref camera\n(CMOS)", ha="center", va="top", fontsize=8, color=NEW)
-    # motorized slides + PC
-    for cx in (370, 580):
-        ax.add_patch(Rectangle((cx + 32, 330), 40, 20, fc="#d9f2ec", ec=NEW, lw=1.2, zorder=5))
-        ax.text(cx + 52, 340, "motor", ha="center", va="center", fontsize=7, color=NEW, zorder=6)
-    ax.add_patch(Rectangle((890, 385), 150, 46, fc="#d9f2ec", ec=NEW, lw=1.4, zorder=5))
-    ax.text(965, 400, "PC", ha="center", fontsize=9, fontweight="bold", color=NEW, zorder=6)
-    ax.text(965, 418, "fringe FFT → slide angles", ha="center", fontsize=7, color=NEW, zorder=6)
+    ref([1080, 1080], [120, 200], lw=1.6)
+    for x0, x1 in ((1054, 1069), (1075, 1085), (1091, 1106)):        # pinhole plate, two holes
+        ax.plot([x0, x1], [200, 200], color="#222", lw=3, solid_capstyle="butt", zorder=4)
+    ref([1072, 1072], [200, 214]); ref([1088, 1088], [200, 214])
+    for xc in (1072, 1088):                                          # photodiodes
+        ax.add_patch(Rectangle((xc - 6, 214), 12, 10, fc="#222", ec="none", zorder=4))
+    ax.text(1112, 200, "pinholes", va="center", fontsize=7.5, color=NEW)
+    ax.text(1080, 240, "PD1  PD2", ha="center", va="top", fontsize=8, color=NEW)
+    # PC + Newport XPS driving the slide rotation stages
+    ax.add_patch(Rectangle((880, 385), 170, 46, fc="#d9f2ec", ec=NEW, lw=1.4, zorder=5))
+    ax.text(965, 400, "PC + Newport XPS", ha="center", fontsize=9, fontweight="bold", color=NEW, zorder=6)
+    ax.text(965, 418, "hold PD1, PD2 constant", ha="center", fontsize=7, color=NEW, zorder=6)
     dash = dict(color=CTL, lw=1.2, ls=(0, (4, 3)), zorder=2)
-    ax.plot([1080, 1080, 1040], [292, 408, 408], **dash)
-    ax.plot([890, 422, 422], [408, 408, 350], **dash)
-    ax.plot([632, 632], [408, 350], **dash)
-    ax.text(30, 380, "red: 810 nm\norange: 630 nm reference\ndashed: feedback\n\nHWPs achromatic\n"
+    ax.plot([1080, 1080, 1050], [256, 408, 408], **dash)
+    ax.plot([880, 440], [408, 408], **dash)
+    for cx, th, axis in ((370, s.theta_A_deg, 1), (580, s.theta_B_deg, 2)):
+        r = np.deg2rad(th)
+        tip = (cx + 30 * np.cos(r), 340 - 30 * np.sin(r) + 4)       # just right of the slide's end
+        ax.plot([cx + 70, cx + 70], [408, 372], **dash)
+        ax.add_patch(FancyArrowPatch((cx + 70, 372), tip, arrowstyle="-|>", mutation_scale=12,
+                                     color=CTL, lw=1.2, ls=(0, (4, 3)), zorder=6))
+        ax.text(cx + 76, 394, f"XPS axis {axis}", fontsize=7, color=CTL, va="center")
+    ax.text(30, 380, "red: 810 nm\norange: 630 nm reference\ndashed: feedback via XPS\n\nHWPs achromatic\n"
             "beam blocks: short-pass\nfilters (stop 810, pass 630)", fontsize=8, color="#444", va="top")
 
 
@@ -420,141 +427,142 @@ def wrap(phi):
     return (np.asarray(phi) + np.pi) % (2 * np.pi) - np.pi
 
 
-def fringe_profile(s: "Setup", noise: float = 0.0, rng=None, rows: int = 128):
-    """Camera image of `s` (full width, the central `rows` rows) summed over rows
-    -> (x in mm, profile). `noise` is the Gaussian pixel noise as a fraction of the
-    brightest pixel."""
-    px = s.pixel_window()
-    c = s.px_to_mm(px)
-    X, Y = np.meshgrid(c, s.px_to_mm(s.pixel_window(rows)))
-    I = s.intensity(X, Y)
-    if noise:
-        rng = np.random.default_rng() if rng is None else rng
-        I = I + noise * I.max() * rng.standard_normal(I.shape)
-    return c, I.sum(axis=0)
+def pinhole_intensity(s: "Setup", x_mm, d_um: float = 50.0) -> np.ndarray:
+    """Mean intensity through pinholes of diameter d_um centred at x_mm (y = 0)."""
+    x_mm = np.atleast_1d(np.asarray(x_mm, dtype=float))
+    o = np.array([-0.35, 0.0, 0.35]) * d_um * 1e-3          # 3 x 3 samples inside the hole
+    X, Y = np.broadcast_arrays(x_mm[:, None, None] + o[None, :, None], o[None, None, :])
+    return s.intensity(X, Y).mean(axis=(1, 2))
 
 
-def pair_k(s: "Setup", pair: str) -> float:
-    """Spatial angular frequency (rad/mm along x) of the fringes between two paths."""
-    return s.beam(pair[0])["kx"] - s.beam(pair[1])["kx"]
+def slide_jacobian(s: "Setup", x_mm, d_um: float = 50.0, h_deg: float = 2e-4) -> np.ndarray:
+    """dI/dtheta (per degree) at each pinhole for slides A and B. In the lab this is
+    measured at start-up by stepping each slide a little and recording the photodiodes."""
+    import copy
+    J = np.zeros((len(np.atleast_1d(x_mm)), 2))
+    for j, attr in enumerate(("theta_A_deg", "theta_B_deg")):
+        up, dn = copy.deepcopy(s), copy.deepcopy(s)
+        setattr(up, attr, getattr(s, attr) + h_deg); setattr(dn, attr, getattr(s, attr) - h_deg)
+        J[:, j] = (pinhole_intensity(up, x_mm, d_um) - pinhole_intensity(dn, x_mm, d_um)) / (2 * h_deg)
+    return J
 
 
-def find_fringe_k(x_mm, profile, k_expected: float, rel_window: float = 0.25) -> float:
-    """Locate the fringe peak in the profile's spectrum near k_expected (rad/mm)."""
-    n = 16 * len(profile)
-    F = np.abs(np.fft.rfft((profile - profile.mean()) * np.hanning(len(profile)), n))
-    k = 2 * np.pi * np.fft.rfftfreq(n, d=x_mm[1] - x_mm[0])
-    m = np.abs(k - abs(k_expected)) < rel_window * abs(k_expected)
-    return float(np.sign(k_expected) * k[m][np.argmax(F[m])])
+def choose_pinholes(s: "Setup", n: int = 2, half_range_mm: float = 2.5, n_grid: int = 161,
+                    d_um: float = 50.0) -> np.ndarray:
+    """Pinhole positions (mm, along x at y = 0) for the photodiodes: bright points (at
+    least 30 % of the peak) on steep fringe slopes, never near a dark fringe. n = 1: the
+    most sensitive point. n = 2: the pair whose sensitivities to the two slides are most
+    independent (largest |det| of the 2 x 2 Jacobian), so both phases can be held."""
+    x = np.linspace(-half_range_mm, half_range_mm, n_grid)
+    I = pinhole_intensity(s, x, d_um)
+    J = slide_jacobian(s, x, d_um) / I.max()
+    ok = np.where(I > 0.3 * I.max())[0]
+    if n == 1:
+        return x[[ok[np.argmax(np.linalg.norm(J[ok], axis=1))]]]
+    best, pair = -1.0, None
+    for a_ in ok:
+        for b_ in ok:
+            if b_ <= a_:
+                continue
+            d = abs(J[a_, 0] * J[b_, 1] - J[a_, 1] * J[b_, 0])
+            if d > best:
+                best, pair = d, (a_, b_)
+    return x[list(pair)]
 
 
-def fringe_phase(x_mm, profile, k: float) -> float:
-    """Phase of the fringe component exp(i k x) (k may be negative): for the pair
-    (p, q) with k = k_p - k_q this is phi_p - phi_q plus a fixed offset."""
-    return float(np.angle(np.sum(profile * np.exp(-1j * k * x_mm))))
+class XPSAxis:
+    """A slide rotation stage on the Newport XPS: a command takes effect after
+    `latency_s` (PC -> XPS -> trajectory start), the stage then moves at up to
+    `vel_deg_s`, and every target is rounded to `step_deg` (minimum incremental motion)."""
+
+    def __init__(self, pos_deg: float, latency_s: float = 0.05, vel_deg_s: float = 2.0,
+                 step_deg: float = 0.001):
+        self.pos = self.target = self.cmd = pos_deg
+        self.latency, self.vel, self.step = latency_s, vel_deg_s, step_deg
+        self.queue = []
+
+    def command(self, t: float, target_deg: float):
+        self.cmd = target_deg
+        self.queue.append((t + self.latency, round(target_deg / self.step) * self.step))
+
+    def advance(self, t: float, dt: float):
+        while self.queue and self.queue[0][0] <= t:
+            self.target = self.queue.pop(0)[1]
+        d = self.target - self.pos
+        self.pos += np.clip(d, -self.vel * dt, self.vel * dt)
 
 
-def solve_slide_angle(target_phase: float, theta_start: float, lam_nm: float, t_mm: float) -> float:
-    """Slide angle (deg) whose phase at lam_nm equals target_phase (Newton's method)."""
-    th = theta_start
-    for _ in range(30):
-        err = slide_phase(th, lam_nm, t_mm) - target_phase
-        th -= err / slide_slope(th, lam_nm, t_mm)
-        if abs(err) < 1e-9:
-            break
-    return th
+def simulate_intensity_lock(main: "Setup", n_pd: int = 2, ref_nm: float = 630.0, pinhole_um: float = 50.0,
+                            duration_s: float = 300.0, dt_s: float = 0.01, loop_hz: float = 10.0,
+                            latency_s: float = 0.05, vel_deg_s: float = 2.0, step_deg: float = 0.001,
+                            gain: float = 0.5, walk_nm: float = 3.0, rate_nm_s: dict | None = None,
+                            pd_noise: float = 0.002, record_every_s: float = 0.1, seed: int = 1) -> dict:
+    """Simulate thermal path-length drift with an intensity lock on the 630 nm reference.
 
-
-class PhaseLock:
-    """Holds the 810 nm phases phi_A - phi_C and phi_B - phi_C at their values at
-    lock time, using only the 630 nm reference camera.
-
-    Each update: read the reference fringe phases psi_AC, psi_BC (unwrapped), remove
-    what the slides themselves contributed at 630 nm, convert the rest to a
-    path-length drift dL, and rotate each slide so that its 810 nm phase cancels
-    2*pi*dL/810. The different dispersion of the slides at the two wavelengths is
-    therefore accounted for. New angles are rounded to the motor step."""
-
-    PAIRS = {"A": "AC", "B": "BC"}
-
-    def __init__(self, main: "Setup", ref: "Setup", motor_step_deg: float = 0.001):
-        self.main, self.ref, self.step = main, ref, motor_step_deg
-        x, prof = fringe_profile(ref)
-        for p, q in (("AB", "BC"),):
-            if abs(abs(pair_k(ref, p)) - abs(pair_k(ref, q))) < 0.15 * abs(pair_k(ref, q)):
-                raise ValueError("AB and BC fringes have (almost) the same spatial frequency: "
-                                 "make the A and C tilts unequal so their phases can be separated.")
-        self.k = {pair: find_fringe_k(x, prof, pair_k(ref, pair)) for pair in self.PAIRS.values()}
-        self.theta0 = {"A": main.theta_A_deg, "B": main.theta_B_deg}
-        self.psi0 = {pair: fringe_phase(x, prof, k) for pair, k in self.k.items()}
-        self.psi_last, self.psi_unw = dict(self.psi0), dict(self.psi0)
-
-    def update(self, x_mm, profile) -> dict:
-        """Feed one reference-camera profile; returns the new slide angles {"A": deg, "B": deg}."""
-        lr, lm, t = self.ref.lam_nm, self.main.lam_nm, self.main.slide_t_mm
-        theta_now = {"A": self.main.theta_A_deg, "B": self.main.theta_B_deg}
-        new = {}
-        for p, pair in self.PAIRS.items():
-            psi = fringe_phase(x_mm, profile, self.k[pair])
-            self.psi_unw[pair] += float(wrap(psi - self.psi_last[pair]))
-            self.psi_last[pair] = psi
-            slide_ref = slide_phase(theta_now[p], lr, t) - slide_phase(self.theta0[p], lr, t)
-            dL_nm = (self.psi_unw[pair] - self.psi0[pair] - slide_ref) * lr / (2 * np.pi)
-            target = slide_phase(self.theta0[p], lm, t) - 2 * np.pi * dL_nm / lm
-            th = solve_slide_angle(target, theta_now[p], lm, t)
-            new[p] = round(th / self.step) * self.step
-        return new
-
-
-def simulate_phase_lock(main: "Setup", ref_nm: float = 630.0, ref_pixel_um: float = 5.2,
-                        n_steps: int = 300, dt_s: float = 1.0, walk_nm: float = 3.0,
-                        rate_nm_s: dict | None = None, ref_noise: float = 0.02,
-                        motor_step_deg: float = 0.001, seed: int = 1) -> dict:
-    """Simulate thermal path-length drift with and without the lock.
-
-    Drift: each arm's path length does a random walk (walk_nm per sqrt(s)) plus a
-    steady rate (rate_nm_s, nm/s). The same path-length change shifts the phase by
-    2*pi*dL/lambda at each wavelength. Per time step the loop reads the reference
-    camera, moves the slides, and the 810 nm phase error is recorded at the moment
-    the PI-MAX would expose (right after the correction)."""
+    The reference passes all three paths (short-pass filter blocks, achromatic HWPs) and
+    lands on n_pd pinholes + photodiodes. At lock time the photodiode readings are stored
+    as setpoints and the 2 x 2 (or 1 x 2) Jacobian dI/dtheta is measured. At loop_hz the
+    PC reads the photodiodes (relative noise pd_noise) and sends integral corrections
+    gain * pinv(J) @ (setpoint - I) to the two XPS axes, which apply them after latency_s
+    at up to vel_deg_s. Drift: each arm's path length does a random walk (walk_nm per
+    sqrt(s)) plus a steady rate (nm/s); a path-length change dL shifts the phase by
+    2*pi*dL/lambda at both wavelengths. Holding the 630 nm phases fixed leaves a small
+    810 nm residual because the slide glass disperses slightly differently from air."""
     import copy
     rng = np.random.default_rng(seed)
     rate = {"A": 2.0, "B": -1.0, "C": 0.5} if rate_nm_s is None else rate_nm_s
     locked, free = copy.deepcopy(main), copy.deepcopy(main)
-    for s in (locked, free):
-        for L in s.launch.values():
+    for s_ in (locked, free):
+        for L in s_.launch.values():
             L.drift_rad, L.blocked = 0.0, False
     ref = copy.deepcopy(locked)
-    ref.lam_nm, ref.pixel_um = ref_nm, ref_pixel_um
+    ref.lam_nm = ref_nm
 
-    def apply_drift(s, dL):
-        for p in PATHS:
-            s.launch[p].drift_rad = 2 * np.pi * dL[p] / s.lam_nm
+    x_ph = choose_pinholes(ref, n=n_pd, d_um=pinhole_um)
+    J = slide_jacobian(ref, x_ph, pinhole_um)
+    Jinv = np.linalg.pinv(J)
+    I_set = pinhole_intensity(ref, x_ph, pinhole_um)
+    axes = [XPSAxis(locked.theta_A_deg, latency_s, vel_deg_s, step_deg),
+            XPSAxis(locked.theta_B_deg, latency_s, vel_deg_s, step_deg)]
 
-    def rel(s):
-        ph = {p: s.beam(p)["phase"] for p in PATHS}
+    def rel(s_):
+        ph = {p: s_.beam(p)["phase"] for p in PATHS}
         return np.array([ph["A"] - ph["C"], ph["B"] - ph["C"]])
 
-    lock = PhaseLock(locked, ref, motor_step_deg)
     target = rel(locked)
     dL = {p: 0.0 for p in PATHS}
-    out = {k: [] for k in ("t", "err_free", "err_lock", "theta_A", "theta_B", "dL_A", "dL_B", "dL_C")}
-    for i in range(1, n_steps + 1):
+    n = int(round(duration_s / dt_s))
+    every_loop = max(1, int(round(1 / (loop_hz * dt_s))))
+    every_rec = max(1, int(round(record_every_s / dt_s)))
+    keys = ("t", "err_free", "err_lock", "pd", "theta_A", "theta_B", "cmd_A", "cmd_B", "dL_A", "dL_B", "dL_C")
+    out = {k: [] for k in keys}
+    for i in range(1, n + 1):
+        t = i * dt_s
         for p in PATHS:
             dL[p] += rate[p] * dt_s + walk_nm * np.sqrt(dt_s) * rng.standard_normal()
-        for s in (locked, free, ref):
-            apply_drift(s, dL)
-        ref.theta_A_deg, ref.theta_B_deg = locked.theta_A_deg, locked.theta_B_deg
-        new = lock.update(*fringe_profile(ref, ref_noise, rng))
-        locked.theta_A_deg, locked.theta_B_deg = new["A"], new["B"]
-        out["t"].append(i * dt_s)
-        out["err_free"].append(wrap(rel(free) - target))
-        out["err_lock"].append(wrap(rel(locked) - target))
-        out["theta_A"].append(new["A"]); out["theta_B"].append(new["B"])
-        for p in PATHS:
-            out["dL_" + p].append(dL[p])
+        for ax_ in axes:
+            ax_.advance(t, dt_s)
+        for s_ in (locked, free, ref):
+            for p in PATHS:
+                s_.launch[p].drift_rad = 2 * np.pi * dL[p] / s_.lam_nm
+        locked.theta_A_deg = ref.theta_A_deg = axes[0].pos
+        locked.theta_B_deg = ref.theta_B_deg = axes[1].pos
+        if i % every_loop == 0:
+            I = pinhole_intensity(ref, x_ph, pinhole_um) * (1 + pd_noise * rng.standard_normal(len(x_ph)))
+            d_theta = gain * Jinv @ (I_set - I)
+            for ax_, d in zip(axes, d_theta):
+                ax_.command(t, ax_.cmd + d)
+        if i % every_rec == 0:
+            out["t"].append(t)
+            out["err_free"].append(wrap(rel(free) - target))
+            out["err_lock"].append(wrap(rel(locked) - target))
+            out["pd"].append(pinhole_intensity(ref, x_ph, pinhole_um) / I_set)
+            out["theta_A"].append(axes[0].pos); out["theta_B"].append(axes[1].pos)
+            out["cmd_A"].append(axes[0].cmd); out["cmd_B"].append(axes[1].cmd)
+            for p in PATHS:
+                out["dL_" + p].append(dL[p])
     out = {k: np.array(v) for k, v in out.items()}
-    out.update(locked=locked, free=free, ref=ref, lock=lock)
+    out.update(locked=locked, free=free, ref=ref, x_pinholes=x_ph, J=J, I_set=I_set)
     return out
 
 
